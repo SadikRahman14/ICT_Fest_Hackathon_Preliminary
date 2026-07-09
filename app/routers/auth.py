@@ -15,6 +15,7 @@ from ..database import get_db
 from ..errors import AppError
 from ..models import Organization, User
 from ..schemas import LoginRequest, RefreshRequest, RegisterRequest
+from sqlalchemy.exc import IntegrityError
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -23,24 +24,38 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 def register(payload: RegisterRequest, db: Session = Depends(get_db)):
     org = db.query(Organization).filter(Organization.name == payload.org_name).first()
     role = "admin" if org is None else "member"
+
     if org is None:
         org = Organization(name=payload.org_name)
         db.add(org)
-        db.commit()
-        db.refresh(org)
+
+        try:
+            db.commit()
+            db.refresh(org)
+
+        except IntegrityError:
+            # Another request created the org at the same time, So this usr should join as a member.
+            db.rollback()
+
+            org = (
+                db.query(Organization)
+                .filter(Organization.name == payload.org_name)
+                .first()
+            )
+
+            if org is None:
+                raise
+
+            role = "member"
 
     existing = (
         db.query(User)
         .filter(User.org_id == org.id, User.username == payload.username)
         .first()
     )
+
     if existing is not None:
-        return {
-            "user_id": existing.id,
-            "org_id": org.id,
-            "username": existing.username,
-            "role": existing.role,
-        }
+        raise AppError(409, "USERNAME_TAKEN", "Username already taken")
 
     user = User(
         org_id=org.id,
@@ -48,9 +63,17 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
         hashed_password=hash_password(payload.password),
         role=role,
     )
+
     db.add(user)
-    db.commit()
-    db.refresh(user)
+
+    try:
+        db.commit()
+        db.refresh(user)
+
+    except IntegrityError:
+        db.rollback()
+        raise AppError(409, "USERNAME_TAKEN", "Username already taken")
+
     return {
         "user_id": user.id,
         "org_id": org.id,
