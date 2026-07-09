@@ -21,10 +21,26 @@ from .models import User
 
 # Access tokens presented to /auth/logout are recorded here so they can no
 # longer be used.
+
+from threading import Lock
+
+_revoked_tokens: set[str] = set()
+_used_refresh_tokens: set[str] = set()
+_refresh_lock = Lock()
+
 _revoked_tokens: set[str] = set()
 
 _PBKDF2_ROUNDS = 100_000
 
+def consume_refresh_token(payload: dict) -> None:
+    jti = payload.get("jti")
+    if not jti:
+        raise AppError(401, "UNAUTHORIZED", "Invalid refresh token")
+
+    with _refresh_lock:
+        if jti in _used_refresh_tokens:
+            raise AppError(401, "UNAUTHORIZED", "Refresh token already used")
+        _used_refresh_tokens.add(jti)
 
 def hash_password(password: str) -> str:
     salt = os.urandom(16)
@@ -47,7 +63,7 @@ def _now_ts() -> int:
 
 def create_access_token(user: User) -> str:
     iat = _now_ts()
-    lifetime = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES * 60)
+    lifetime = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     payload = {
         "sub": str(user.id),
         "org": user.org_id,
@@ -90,12 +106,16 @@ def get_token_payload(request: Request) -> dict:
     header = request.headers.get("Authorization")
     if not header or not header.startswith("Bearer "):
         raise AppError(401, "UNAUTHORIZED", "Missing bearer token")
+
     token = header[len("Bearer "):].strip()
     payload = decode_token(token)
+
     if payload.get("type") != "access":
         raise AppError(401, "UNAUTHORIZED", "Wrong token type")
-    if payload.get("sub") in _revoked_tokens:
+
+    if payload.get("jti") in _revoked_tokens:
         raise AppError(401, "UNAUTHORIZED", "Token has been revoked")
+
     return payload
 
 

@@ -10,54 +10,92 @@ from ..auth import (
     hash_password,
     revoke_access_token,
     verify_password,
+    consume_refresh_token,
 )
+
 from ..database import get_db
 from ..errors import AppError
 from ..models import Organization, User
 from ..schemas import LoginRequest, RefreshRequest, RegisterRequest
+from sqlalchemy.exc import IntegrityError
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
 
 
 @router.post("/register", status_code=201)
 def register(payload: RegisterRequest, db: Session = Depends(get_db)):
     org = db.query(Organization).filter(Organization.name == payload.org_name).first()
-    role = "admin" if org is None else "member"
+
     if org is None:
         org = Organization(name=payload.org_name)
         db.add(org)
-        db.commit()
-        db.refresh(org)
+
+        try:
+            db.flush()  # gets org.id without committing yet
+
+            user = User(
+                org_id=org.id,
+                username=payload.username,
+                hashed_password=hash_password(payload.password),
+                role="admin",
+            )
+
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+            return {
+                "user_id": user.id,
+                "org_id": org.id,
+                "username": user.username,
+                "role": user.role,
+            }
+
+        except IntegrityError:
+            db.rollback()
+
+            org = (
+                db.query(Organization)
+                .filter(Organization.name == payload.org_name)
+                .first()
+            )
+
+            if org is None:
+                raise
 
     existing = (
         db.query(User)
         .filter(User.org_id == org.id, User.username == payload.username)
         .first()
     )
+
     if existing is not None:
-        return {
-            "user_id": existing.id,
-            "org_id": org.id,
-            "username": existing.username,
-            "role": existing.role,
-        }
+        raise AppError(409, "USERNAME_TAKEN", "Username already taken")
 
     user = User(
         org_id=org.id,
         username=payload.username,
         hashed_password=hash_password(payload.password),
-        role=role,
+        role="member",
     )
+
     db.add(user)
-    db.commit()
-    db.refresh(user)
+
+    try:
+        db.commit()
+        db.refresh(user)
+
+    except IntegrityError:
+        db.rollback()
+        raise AppError(409, "USERNAME_TAKEN", "Username already taken")
+
     return {
         "user_id": user.id,
         "org_id": org.id,
         "username": user.username,
         "role": user.role,
     }
-
 
 @router.post("/login")
 def login(payload: LoginRequest, db: Session = Depends(get_db)):
@@ -81,11 +119,16 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
 @router.post("/refresh")
 def refresh(payload: RefreshRequest, db: Session = Depends(get_db)):
     data = decode_token(payload.refresh_token)
+
     if data.get("type") != "refresh":
         raise AppError(401, "UNAUTHORIZED", "Wrong token type")
+
+    consume_refresh_token(data)
+
     user = db.query(User).filter(User.id == int(data["sub"])).first()
     if user is None:
         raise AppError(401, "UNAUTHORIZED", "Unknown user")
+
     return {
         "access_token": create_access_token(user),
         "refresh_token": create_refresh_token(user),
