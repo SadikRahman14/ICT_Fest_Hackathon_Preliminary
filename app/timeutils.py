@@ -4,13 +4,13 @@ from datetime import datetime, timezone
 
 def parse_input_datetime(value: str) -> datetime:
     """Parse an ISO 8601 datetime into a naive UTC datetime for storage.
-
+    
     Inputs that carry a UTC offset are normalized to UTC; naive inputs are
     treated as UTC as-is.
     """
     dt = datetime.fromisoformat(value)
     if dt.tzinfo is not None:
-        dt = dt.replace(tzinfo=None)
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
     return dt
 
 

@@ -8,6 +8,7 @@ from sqlalchemy import (
     Integer,
     String,
     UniqueConstraint,
+    Index,
 )
 from sqlalchemy.orm import relationship
 
@@ -57,6 +58,7 @@ class Booking(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     refunds = relationship("RefundLog", backref="booking")
+    quota_locks = relationship("QuotaLock", backref="booking", cascade="all, delete-orphan")
 
 
 class RefundLog(Base):
@@ -67,3 +69,19 @@ class RefundLog(Base):
     amount_cents = Column(Integer, nullable=False)
     status = Column(String, nullable=False)
     processed_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class QuotaLock(Base):
+    """Tracks quota usage to prevent concurrent quota violations."""
+    __tablename__ = "quota_locks"
+    __table_args__ = (
+        UniqueConstraint("user_id", "booking_id", name="uq_quota_lock_user_booking"),
+        Index("ix_quota_locks_start_time", "start_time"),
+        Index("ix_quota_locks_created_at", "created_at"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    booking_id = Column(Integer, ForeignKey("bookings.id"), nullable=True, index=True)  # Allow null initially
+    start_time = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

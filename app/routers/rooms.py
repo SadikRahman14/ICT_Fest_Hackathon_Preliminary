@@ -11,7 +11,7 @@ from ..errors import AppError
 from ..models import Booking, Room, User
 from ..schemas import RoomCreateRequest
 from ..services import stats
-from ..timeutils import iso_utc
+from ..timeutils import iso_utc, parse_input_datetime
 
 router = APIRouter(prefix="/rooms", tags=["rooms"])
 
@@ -107,9 +107,15 @@ def room_stats(
     user: User = Depends(get_current_user),
 ):
     room = _get_org_room(db, room_id, user.org_id)
-    current = stats.get(room.id)
+    
+    # Recalculate stats from database to ensure consistency
+    stats.recalculate_from_db(db, room.id)
+    
+    # Get the recalculated stats
+    stats_data = stats.get(room.id)
+    
     return {
         "room_id": room.id,
-        "total_confirmed_bookings": current["count"],
-        "total_revenue_cents": current["revenue"],
+        "total_confirmed_bookings": stats_data["count"],
+        "total_revenue_cents": stats_data["revenue"],
     }
