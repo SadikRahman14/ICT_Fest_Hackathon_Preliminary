@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import and_
 
 from .. import cache
-from ..auth import get_current_user
+from ..auth import get_current_user, require_admin
 from ..database import get_db
 from ..errors import AppError
 from ..models import Booking, Room, User
@@ -14,14 +14,13 @@ from ..schemas import BookingCreateRequest
 from ..serializers import serialize_booking
 from ..services import notifications, ratelimit, reference, stats
 from ..services.refunds import log_refund
+from ..services.quota import acquire_quota_lock, release_quota_lock, update_quota_lock_with_booking, cleanup_expired_locks
 from ..timeutils import iso_utc, parse_input_datetime
 
 router = APIRouter(tags=["bookings"])
 
 MIN_DURATION_HOURS = 1
 MAX_DURATION_HOURS = 8
-QUOTA_LIMIT = 3
-QUOTA_WINDOW_HOURS = 24
 
 
 def _has_conflict(db: Session, room_id: int, start: datetime, end: datetime) -> bool:
@@ -41,26 +40,6 @@ def _has_conflict(db: Session, room_id: int, start: datetime, end: datetime) -> 
         .first()
     )
     return existing is not None
-
-
-def _check_quota(db: Session, user_id: int, now: datetime, start: datetime) -> None:
-    """Check if user has exceeded booking quota for the next 24 hours."""
-    window_end = now + timedelta(hours=QUOTA_WINDOW_HOURS)
-    if not (now < start <= window_end):
-        return
-    
-    count = (
-        db.query(Booking)
-        .filter(
-            Booking.user_id == user_id,
-            Booking.status == "confirmed",
-            Booking.start_time > now,
-            Booking.start_time <= window_end,
-        )
-        .count()
-    )
-    if count >= QUOTA_LIMIT:
-        raise AppError(409, "QUOTA_EXCEEDED", "Booking quota exceeded")
 
 
 @router.post("/bookings", status_code=201)
@@ -102,8 +81,15 @@ def create_booking(
     if _has_conflict(db, room.id, start, end):
         raise AppError(409, "ROOM_CONFLICT", "Room already booked for this interval")
 
-    # Check quota
-    _check_quota(db, user.id, now, start)
+    # ACQUIRE QUOTA LOCK - This prevents concurrent quota violations
+    # The lock is released automatically if booking creation fails
+    try:
+        acquire_quota_lock(db, user.id, start)
+    except AppError:
+        raise
+    except Exception:
+        db.rollback()
+        raise AppError(409, "QUOTA_EXCEEDED", "Booking quota exceeded")
 
     # Calculate price
     price_cents = room.hourly_rate_cents * duration_hours
@@ -120,7 +106,19 @@ def create_booking(
         created_at=now,
     )
     db.add(booking)
-    db.commit()
+    
+    # Update the quota lock with the booking ID
+    update_quota_lock_with_booking(db, booking.id)
+    
+    # Commit the transaction - this makes everything atomic
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        # Release quota lock on error
+        release_quota_lock(db)
+        raise AppError(409, "QUOTA_EXCEEDED", "Booking quota exceeded")
+    
     db.refresh(booking)
 
     # Update stats and cache
@@ -209,11 +207,12 @@ def cancel_booking(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    # First, check if booking exists in user's org
+    # Use SELECT FOR UPDATE to lock the booking row for concurrent cancellations
     booking = (
         db.query(Booking)
         .join(Room, Booking.room_id == Room.id)
         .filter(Booking.id == booking_id, Room.org_id == user.org_id)
+        .with_for_update()  # Lock the row
         .first()
     )
     if booking is None:
@@ -243,24 +242,24 @@ def cancel_booking(
     refund_amount_cents = int(round(booking.price_cents * (refund_percent / 100.0)))
 
     # Create refund log entry
-    if refund_percent > 0:
-        log_refund(db, booking, refund_percent)
-    else:
-        # Log zero refund
-        from ..models import RefundLog
-        entry = RefundLog(
-            booking_id=booking.id,
-            amount_cents=0,
-            status="processed",
-            processed_at=now,
-        )
-        db.add(entry)
-        db.commit()
-        db.refresh(entry)
+    from ..models import RefundLog
+    entry = RefundLog(
+        booking_id=booking.id,
+        amount_cents=refund_amount_cents,
+        status="processed",
+        processed_at=now,
+    )
+    db.add(entry)
 
     # Update booking status
     booking.status = "cancelled"
-    db.commit()
+    
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise AppError(409, "ALREADY_CANCELLED", "Booking already cancelled")
+    
     db.refresh(booking)
 
     # Update stats and cache
@@ -277,3 +276,13 @@ def cancel_booking(
         "refund_percent": refund_percent,
         "refund_amount_cents": refund_amount_cents,
     }
+
+
+# Add a cleanup endpoint or background task for quota locks
+@router.post("/admin/cleanup-locks")
+def cleanup_locks(
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    cleanup_expired_locks(db)
+    return {"status": "ok"}

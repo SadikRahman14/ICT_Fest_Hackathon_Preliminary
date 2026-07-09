@@ -108,24 +108,11 @@ def room_stats(
 ):
     room = _get_org_room(db, room_id, user.org_id)
     
-    # Ensure stats are consistent with actual bookings
-    stats_data = stats.get(room.id)
+    # Recalculate stats from database to ensure consistency
+    stats.recalculate_from_db(db, room.id)
     
-    # If stats are empty or stale, recalculate from database
-    if stats_data["count"] == 0 and stats_data["revenue"] == 0:
-        confirmed = (
-            db.query(Booking)
-            .filter(
-                Booking.room_id == room.id,
-                Booking.status == "confirmed"
-            )
-            .all()
-        )
-        if confirmed:
-            stats_data = {
-                "count": len(confirmed),
-                "revenue": sum(b.price_cents for b in confirmed)
-            }
+    # Get the recalculated stats
+    stats_data = stats.get(room.id)
     
     return {
         "room_id": room.id,

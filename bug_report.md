@@ -587,3 +587,14 @@ if stats_data["count"] == 0 and stats_data["revenue"] == 0:
         }
 ```
 
+## Bug 19: Booking quota
+
+**File:** `booking.py`
+
+### Description
+A member may hold at most 3 confirmed bookings with start time in the window.
+
+### Fix
+Added a quata.py file to check 3 confirmed belongings in the given timespace:
+
+
