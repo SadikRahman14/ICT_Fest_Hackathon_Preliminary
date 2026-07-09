@@ -10,6 +10,8 @@ from ..auth import (
     hash_password,
     revoke_access_token,
     verify_password,
+    mark_refresh_token_used,
+    is_refresh_token_used,
 )
 from ..database import get_db
 from ..errors import AppError
@@ -34,7 +36,7 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
             db.refresh(org)
 
         except IntegrityError:
-            # Another request created the org at the same time, So this usr should join as a member.
+            # Another request created the org at the same time, So this user should join as a member.
             db.rollback()
 
             org = (
@@ -104,11 +106,21 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
 @router.post("/refresh")
 def refresh(payload: RefreshRequest, db: Session = Depends(get_db)):
     data = decode_token(payload.refresh_token)
+    
     if data.get("type") != "refresh":
         raise AppError(401, "UNAUTHORIZED", "Wrong token type")
+    
+    # Check if refresh token has been used already (single-use)
+    if is_refresh_token_used(data["jti"]):
+        raise AppError(401, "UNAUTHORIZED", "Refresh token already used")
+    
     user = db.query(User).filter(User.id == int(data["sub"])).first()
     if user is None:
         raise AppError(401, "UNAUTHORIZED", "Unknown user")
+    
+    # Mark this refresh token as used
+    mark_refresh_token_used(data["jti"])
+    
     return {
         "access_token": create_access_token(user),
         "refresh_token": create_refresh_token(user),
